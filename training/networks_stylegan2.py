@@ -187,6 +187,58 @@ class Conv2dLayer(torch.nn.Module):
 
 #----------------------------------------------------------------------------
 
+from .ffc.spectral_transform import SpectralTransform
+from .ffc.resizer import Resizer
+#----------------------------------------------------------------------------
+
+@misc.profiled_function
+def ffc_mod(
+    in_ch: int,
+    out_ch: int,
+    ratio_gin: float,
+    ratio_gout: float,
+    x,                          # Input tensor of shape [batch_size, in_channels, in_height, in_width].
+    weight,                     # Weight tensor of shape [out_channels, in_channels, kernel_height, kernel_width].
+    styles,                     # Modulation coefficients of shape [batch_size, in_channels].
+    noise           = None,     # Optional noise tensor to add to the output activations.
+    up              = 1,        # Integer upsampling factor.
+    down            = 1,        # Integer downsampling factor.
+    padding         = 0,        # Padding with respect to the upsampled image.
+    resample_filter = None,     # Low-pass filter to apply when resampling activations. Must be prepared beforehand by calling upfirdn2d.setup_filter().
+    demodulate      = True,     # Apply weight demodulation?
+    flip_weight     = True,     # False = convolution, True = correlation (matches torch.nn.functional.conv2d).
+    fused_modconv   = True,     # Perform modulation, convolution, and demodulation as a single fused operation?
+):
+    in_cg = int(in_ch * ratio_gin)
+    in_cl = in_ch - in_cg
+    out_cg = int(out_ch * ratio_gout)
+    out_cl = out_ch - out_cg
+
+    has_l2l = not (in_cl == 0 or out_cl == 0)
+    has_l2g = not (in_cl == 0 or out_cg == 0)
+    has_g2l = not (in_cg == 0 or out_cl == 0)
+    has_g2g = not (in_cg == 0 or out_cg == 0)
+
+    x_l, x_g = x if type(x) is tuple else (x, 0)
+    out_xl, out_xg = 0, 0
+
+    ## Local Signal
+    if has_l2l:
+        out_xl = modulated_conv2d(x=x_l, weight=weight, styles=styles, noise=noise, up=up, down=down,
+            padding=padding, resample_filter=resample_filter, demodulate=demodulate, flip_weight=flip_weight, fused_modconv=fused_modconv)
+    if has_g2l:
+        out_xl += modulated_conv2d(x=x_g, weight=weight, styles=styles, noise=noise, up=up, down=down,
+            padding=padding, resample_filter=resample_filter, demodulate=demodulate, flip_weight=flip_weight, fused_modconv=fused_modconv)
+    
+    ## Global Signal
+    if has_l2g:
+        out_xg = modulated_conv2d(x=x_l, weight=weight, styles=styles, noise=noise, up=up, down=down,
+            padding=padding, resample_filter=resample_filter, demodulate=demodulate, flip_weight=flip_weight, fused_modconv=fused_modconv)
+    
+    return out_xl, out_xg
+
+#----------------------------------------------------------------------------
+
 @persistence.persistent_class
 class MappingNetwork(torch.nn.Module):
     def __init__(self,
@@ -284,6 +336,8 @@ class SynthesisLayer(torch.nn.Module):
         resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
         conv_clamp      = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
         channels_last   = False,        # Use channels_last format for the weights?
+        gin             = 0.0,
+        gout            = 0.0
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -297,6 +351,8 @@ class SynthesisLayer(torch.nn.Module):
         self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
         self.padding = kernel_size // 2
         self.act_gain = bias_act.activation_funcs[activation].def_gain
+        self.gin = gin
+        self.gout = gout
 
         self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
@@ -305,27 +361,40 @@ class SynthesisLayer(torch.nn.Module):
             self.register_buffer('noise_const', torch.randn([resolution, resolution]))
             self.noise_strength = torch.nn.Parameter(torch.zeros([]))
         self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
+        
+        self.spectral_transform = SpectralTransform(in_channels, out_channels, 1, 1, enable_lfu=True)
 
     def forward(self, x, w, noise_mode='random', fused_modconv=True, gain=1):
         assert noise_mode in ['random', 'const', 'none']
         in_resolution = self.resolution // self.up
-        misc.assert_shape(x, [None, self.in_channels, in_resolution, in_resolution])
+
+        x_l, x_g = x if type(x) is tuple else (x, 0)
+        ## asserts width and height, so we are safe!
+        misc.assert_shape(x_l, [None, self.in_channels, in_resolution, in_resolution])
         styles = self.affine(w)
 
         noise = None
         if self.use_noise and noise_mode == 'random':
-            noise = torch.randn([x.shape[0], 1, self.resolution, self.resolution], device=x.device) * self.noise_strength
+            ## only gets batch size, so we are safe
+            noise = torch.randn([x_l.shape[0], 1, self.resolution, self.resolution], device=x_l.device) * self.noise_strength
         if self.use_noise and noise_mode == 'const':
             noise = self.noise_const * self.noise_strength
 
         flip_weight = (self.up == 1) # slightly faster
-        x = modulated_conv2d(x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
-            padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
 
+        x_l, x_g = ffc_mod(self.in_channels, self.out_channels, self.gin, self.gout,
+                    x=x, weight=self.weight, styles=styles, noise=noise, up=self.up,
+            padding=self.padding, resample_filter=self.resample_filter, flip_weight=flip_weight, fused_modconv=fused_modconv)
+        
         act_gain = self.act_gain * gain
         act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
-        x = bias_act.bias_act(x, self.bias.to(x.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
-        return x
+        x_l = bias_act.bias_act(x_l, self.bias.to(x_l.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
+
+        if type(x_g) is not int:
+            x_g = self.spectral_transform(x_g)
+            x_l = bias_act.bias_act(x_l, self.bias.to(x_l.dtype), act=self.activation, gain=act_gain, clamp=act_clamp)
+
+        return x_l, x_g
 
     def extra_repr(self):
         return ' '.join([
@@ -394,13 +463,15 @@ class SynthesisBlock(torch.nn.Module):
         if in_channels == 0:
             self.const = torch.nn.Parameter(torch.randn([out_channels, resolution, resolution]))
 
+        mid_g = 0
         if in_channels != 0:
+            mid_g = 0.25
             self.conv0 = SynthesisLayer(in_channels, out_channels, w_dim=w_dim, resolution=resolution, up=2,
-                resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last, **layer_kwargs)
+                resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last, gin=0.0, gout=mid_g, **layer_kwargs)
             self.num_conv += 1
 
         self.conv1 = SynthesisLayer(out_channels, out_channels, w_dim=w_dim, resolution=resolution,
-            conv_clamp=conv_clamp, channels_last=self.channels_last, **layer_kwargs)
+            conv_clamp=conv_clamp, channels_last=self.channels_last, gin=mid_g , gout=0.0, **layer_kwargs)
         self.num_conv += 1
 
         if is_last or architecture == 'skip':
@@ -411,6 +482,8 @@ class SynthesisBlock(torch.nn.Module):
         if in_channels != 0 and architecture == 'resnet':
             self.skip = Conv2dLayer(in_channels, out_channels, kernel_size=1, bias=False, up=2,
                 resample_filter=resample_filter, channels_last=self.channels_last)
+            
+        self.resizer = Resizer()
 
     def forward(self, x, img, ws, force_fp32=False, fused_modconv=None, update_emas=False, **layer_kwargs):
         _ = update_emas # unused
@@ -440,10 +513,12 @@ class SynthesisBlock(torch.nn.Module):
             y = self.skip(x, gain=np.sqrt(0.5))
             x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, gain=np.sqrt(0.5), **layer_kwargs)
+            x = self.resizer(x)
             x = y.add_(x)
         else:
             x = self.conv0(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
             x = self.conv1(x, next(w_iter), fused_modconv=fused_modconv, **layer_kwargs)
+            x = self.resizer(x)
 
         # ToRGB.
         if img is not None:
